@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @ts-check
 /**
  * Hyperliquid perp positioning flow seeder.
  *
@@ -21,6 +22,8 @@ export const HYPERLIQUID_URL = 'https://api.hyperliquid.xyz/info';
 export const REQUEST_TIMEOUT_MS = 15_000;
 export const MIN_NOTIONAL_USD_24H = 500_000;
 export const STALE_SYMBOL_DROP_AFTER_POLLS = 3;
+export const VOLUME_BASELINE_MIN_SAMPLES = 12; // 1h @ 5min cadence — minimum history to score volume spike
+export const MAX_UPSTREAM_UNIVERSE = 2000;     // defensive cap; Hyperliquid has ~200 perps today
 
 // Hardcoded symbol whitelist — never iterate the full universe.
 // `class`: scoring threshold class. `display`: UI label. `group`: panel section.
@@ -80,8 +83,19 @@ export function scoreBasis(mark, oracle, threshold) {
 
 /**
  * Compute composite score and alerts for one asset.
+ *
  * `prevAsset` may be null/undefined for cold start; in that case OI delta and
  * volume spike are scored as 0 (we lack baselines).
+ *
+ * Per-asset `warmup` is TRUE until the volume baseline has VOLUME_BASELINE_MIN_SAMPLES
+ * and there is a prior OI to compute delta against — NOT just on the first poll after
+ * cold start. Without this, the "warming up" badge flips to false on poll 2 while the
+ * score is still missing most of its baseline.
+ *
+ * @param {{ symbol: string; display: string; class: 'crypto'|'commodity'; group: string }} meta
+ * @param {Record<string, string>} ctx
+ * @param {any} prevAsset
+ * @param {{ coldStart?: boolean }} [opts]
  */
 export function computeAsset(meta, ctx, prevAsset, opts = {}) {
   const t = THRESHOLDS[meta.class];
@@ -91,14 +105,20 @@ export function computeAsset(meta, ctx, prevAsset, opts = {}) {
   const oraclePx = Number(ctx.oraclePx);
   const dayNotional = Number(ctx.dayNtlVlm);
   const prevOi = prevAsset?.openInterest ?? null;
-  const prevVolSamples = (prevAsset?.sparkVol || []).filter((v) => Number.isFinite(v));
+  const prevVolSamples = /** @type {number[]} */ ((prevAsset?.sparkVol || []).filter(
+    /** @param {unknown} v */ (v) => Number.isFinite(v)
+  ));
 
   const fundingScore = scoreFunding(fundingRate, t.funding);
 
-  // Volume spike scored against rolling 12-sample mean of prior dayNotional.
+  // Volume spike scored against the MOST RECENT 12 samples in sparkVol.
+  // sparkVol is newest-at-tail (see shiftAndAppend), so we must slice(-N) — NOT
+  // slice(0, N), which would anchor the baseline to the oldest window and never
+  // update after the first hour.
   let volumeScore = 0;
-  if (dayNotional >= MIN_NOTIONAL_USD_24H && prevVolSamples.length >= 12) {
-    const recent = prevVolSamples.slice(0, 12);
+  const volumeBaselineReady = prevVolSamples.length >= VOLUME_BASELINE_MIN_SAMPLES;
+  if (dayNotional >= MIN_NOTIONAL_USD_24H && volumeBaselineReady) {
+    const recent = prevVolSamples.slice(-VOLUME_BASELINE_MIN_SAMPLES);
     const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
     volumeScore = scoreVolume(dayNotional, avg, t.volume);
   }
@@ -117,6 +137,11 @@ export function computeAsset(meta, ctx, prevAsset, opts = {}) {
   const sparkOi      = shiftAndAppend(prevAsset?.sparkOi,      Number.isFinite(currentOi) ? currentOi : 0);
   const sparkScore   = shiftAndAppend(prevAsset?.sparkScore,   composite);
   const sparkVol     = shiftAndAppend(prevAsset?.sparkVol,     Number.isFinite(dayNotional) ? dayNotional : 0);
+
+  // Warmup stays TRUE until both baselines are usable — cold-start OR insufficient
+  // volume history OR missing prior OI. Clears only when the asset can produce all
+  // four component scores.
+  const warmup = opts.coldStart === true || !volumeBaselineReady || prevOi == null;
 
   const alerts = [];
   if (composite >= ALERT_THRESHOLD) {
@@ -146,7 +171,7 @@ export function computeAsset(meta, ctx, prevAsset, opts = {}) {
     staleSince: null,
     missingPolls: 0,
     alerts,
-    warmup: opts.warmup === true,
+    warmup,
   };
 }
 
@@ -197,6 +222,9 @@ export function validateUpstream(raw) {
   if (meta.universe.length < 50) {
     throw new Error(`Hyperliquid universe suspiciously small: ${meta.universe.length}`);
   }
+  if (meta.universe.length > MAX_UPSTREAM_UNIVERSE) {
+    throw new Error(`Hyperliquid universe over cap: ${meta.universe.length} > ${MAX_UPSTREAM_UNIVERSE}`);
+  }
   if (!Array.isArray(assetCtxs) || assetCtxs.length !== meta.universe.length) {
     throw new Error('Hyperliquid assetCtxs length does not match universe');
   }
@@ -232,8 +260,17 @@ export function buildSnapshot(upstream, prevSnapshot, opts = {}) {
   // Treat stale prior snapshot (>3× cadence = 900s) as cold start.
   const coldStart = !prevSnapshot || prevAgeMs > 900_000;
 
+  // Info-log unseen xyz: perps once per run so ops sees when Hyperliquid adds
+  // commodity/FX markets we could add to the whitelist.
+  const whitelisted = new Set(ASSETS.map((a) => a.symbol));
+  const unknownXyz = validated.universe
+    .map((/** @type {{ name: string }} */ u) => u.name)
+    .filter((name) => typeof name === 'string' && name.startsWith('xyz:') && !whitelisted.has(name));
+  if (unknownXyz.length > 0) {
+    console.log(`  Unknown xyz: perps upstream (not whitelisted): ${unknownXyz.slice(0, 20).join(', ')}${unknownXyz.length > 20 ? ` (+${unknownXyz.length - 20} more)` : ''}`);
+  }
+
   const assets = [];
-  let warmupAny = false;
   for (const meta of ASSETS) {
     const ctx = ctxBySymbol.get(meta.symbol);
     if (!ctx) {
@@ -254,15 +291,18 @@ export function buildSnapshot(upstream, prevSnapshot, opts = {}) {
       continue;
     }
     const prev = coldStart ? null : prevByName.get(meta.symbol);
-    const asset = computeAsset(meta, ctx, prev, { warmup: coldStart });
+    const asset = computeAsset(meta, ctx, prev, { coldStart });
     assets.push(asset);
-    if (coldStart) warmupAny = true;
   }
+
+  // Snapshot warmup = any asset still building a baseline. Reflects real
+  // component-score readiness, not just the first poll after cold start.
+  const warmup = assets.some((a) => a.warmup === true);
 
   return {
     ts: now,
     fetchedAt: new Date(now).toISOString(),
-    warmup: warmupAny,
+    warmup,
     assetCount: assets.length,
     assets,
   };

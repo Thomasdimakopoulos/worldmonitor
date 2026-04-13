@@ -140,11 +140,73 @@ describe('computeAsset min-notional guard', () => {
 describe('computeAsset cold-start (no prev)', () => {
   it('zeros volumeScore and oiScore on first run', () => {
     const ctx = { funding: '0.0005', openInterest: '1000', markPx: '100', oraclePx: '100', dayNtlVlm: '5000000' };
-    const out = computeAsset(META_BTC, ctx, null, { warmup: true });
+    const out = computeAsset(META_BTC, ctx, null, { coldStart: true });
     assert.equal(out.oiScore, 0);
     assert.equal(out.volumeScore, 0);
     assert.ok(out.fundingScore > 0); // funding still computable
     assert.equal(out.warmup, true);
+  });
+});
+
+describe('warmup persists until baseline is usable (not just first poll)', () => {
+  it('stays warmup=true after coldStart clears if volume baseline has <12 samples', () => {
+    // Second poll: coldStart=false, but only 1 prior vol sample.
+    const prev = {
+      symbol: 'BTC', openInterest: 1000,
+      sparkVol: [1_000_000],
+      sparkFunding: [], sparkOi: [1000], sparkScore: [],
+    };
+    const ctx = { funding: '0.0005', openInterest: '1010', markPx: '100', oraclePx: '100', dayNtlVlm: '5000000' };
+    const out = computeAsset(META_BTC, ctx, prev, { coldStart: false });
+    assert.equal(out.warmup, true, 'should stay warmup while baseline < 12 samples');
+    assert.equal(out.volumeScore, 0, 'volume scoring must wait for baseline');
+  });
+
+  it('clears warmup=false once baseline has >=12 samples AND prior OI exists', () => {
+    const prev = {
+      symbol: 'BTC', openInterest: 1000,
+      sparkVol: Array(12).fill(1_000_000),
+      sparkFunding: [], sparkOi: Array(12).fill(1000), sparkScore: [],
+    };
+    const ctx = { funding: '0.0001', openInterest: '1010', markPx: '100', oraclePx: '100', dayNtlVlm: '1000000' };
+    const out = computeAsset(META_BTC, ctx, prev, { coldStart: false });
+    assert.equal(out.warmup, false);
+  });
+
+  it('stays warmup=true when prior OI is missing even with full vol baseline', () => {
+    const prev = {
+      symbol: 'BTC', openInterest: null,
+      sparkVol: Array(12).fill(1_000_000),
+      sparkFunding: [], sparkOi: [], sparkScore: [],
+    };
+    const ctx = { funding: '0', openInterest: '1000', markPx: '100', oraclePx: '100', dayNtlVlm: '1000000' };
+    const out = computeAsset(META_BTC, ctx, prev, { coldStart: false });
+    assert.equal(out.warmup, true);
+    assert.equal(out.oiScore, 0);
+  });
+});
+
+describe('volume baseline uses the MOST RECENT window (slice(-12), not slice(0,12))', () => {
+  // Regression: sparkVol is newest-at-tail via shiftAndAppend. Using slice(0,12)
+  // anchors the baseline to the OLDEST window forever once len >= 12 + new samples
+  // keep appending. Verify the baseline tracks the newest 12 samples.
+  it('reflects recent-volume regime, not stale oldest-window baseline', () => {
+    // Tail = last 12 samples (recent baseline ~200k).
+    // Head = old samples (~1M). If we regress to slice(0,12), avg=1M and dayNotional=2M
+    // would score volume=~2/5=40. With correct slice(-12), avg=200k so 2M/200k=10x → score=100.
+    const sparkVol = [
+      ...Array(20).fill(1_000_000), // oldest
+      ...Array(12).fill(200_000),   // newest (baseline)
+    ];
+    const prev = {
+      symbol: 'BTC', openInterest: 1000,
+      sparkVol,
+      sparkFunding: [], sparkOi: Array(12).fill(1000), sparkScore: [],
+    };
+    const ctx = { funding: '0', openInterest: '1010', markPx: '100', oraclePx: '100', dayNtlVlm: '2000000' };
+    const out = computeAsset(META_BTC, ctx, prev, { coldStart: false });
+    // Recent-window baseline: 2M / 200k / 5 * 100 = 200 → clamp 100.
+    assert.equal(out.volumeScore, 100, `expected volume baseline to track recent window, got score=${out.volumeScore}`);
   });
 });
 

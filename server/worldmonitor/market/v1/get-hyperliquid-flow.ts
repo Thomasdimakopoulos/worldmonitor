@@ -56,6 +56,8 @@ export async function getHyperliquidFlow(
   try {
     const raw = await getCachedJson(SEED_CACHE_KEY, true) as SeededSnapshot | null;
     if (!raw?.assets || raw.assets.length === 0) {
+      // No error — seeder hasn't run yet, or empty snapshot. Distinguish from
+      // parse/Redis failures below (those hit the catch and log).
       return {
         ts: '0',
         fetchedAt: '',
@@ -97,7 +99,8 @@ export async function getHyperliquidFlow(
       assets,
       unavailable: false,
     };
-  } catch {
+  } catch (err) {
+    console.error('[getHyperliquidFlow] Redis read or parse failed:', err instanceof Error ? err.message : err);
     return {
       ts: '0',
       fetchedAt: '',

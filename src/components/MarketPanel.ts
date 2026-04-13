@@ -345,18 +345,12 @@ interface EcbFxRateItem {
 
 type CommoditiesTab = 'commodities' | 'fx' | 'xau' | 'flow';
 
-interface RawHyperliquidAsset {
-  symbol: string;
-  display: string;
-  group: string;
-  funding: string;
-  oiScore: number;
-  composite: number;
-  warmup: boolean;
-  stale: boolean;
-  sparkOi: number[];
-  sparkScore: number[];
-}
+// Use the generated types directly — never hand-roll a subset, which silently
+// drifts when the proto gains fields.
+import type {
+  GetHyperliquidFlowResponse,
+  HyperliquidAssetFlow,
+} from '@/generated/client/worldmonitor/market/v1/service_client';
 
 function parseFiniteNumber(s: string): number | null {
   if (typeof s !== 'string' || s === '') return null;
@@ -377,12 +371,10 @@ function oiDelta1h(sparkOi: number[]): number | null {
   return (last - lookback) / lookback;
 }
 
-export function mapHyperliquidFlowResponse(resp: {
-  ts: string; warmup: boolean; assets: RawHyperliquidAsset[];
-}): HyperliquidFlowView {
+export function mapHyperliquidFlowResponse(resp: GetHyperliquidFlowResponse): HyperliquidFlowView {
   const fxAssets: HyperliquidAssetView[] = [];
   const commodityAssets: HyperliquidAssetView[] = [];
-  for (const a of resp.assets) {
+  for (const a of resp.assets as HyperliquidAssetFlow[]) {
     const view: HyperliquidAssetView = {
       symbol: a.symbol,
       display: a.display,
@@ -486,7 +478,8 @@ export class CommoditiesPanel extends Panel {
       }
       if (this._tab === 'flow') this._render();
       return true;
-    } catch {
+    } catch (err) {
+      console.error('[CommoditiesPanel.fetchHyperliquidFlow] RPC failed:', err instanceof Error ? err.message : err);
       // Don't blow away an existing flow snapshot on transient fetch errors.
       if (!this._flow) this._flow = { ts: 0, warmup: true, fxAssets: [], commodityAssets: [], unavailable: true };
       if (this._tab === 'flow') this._render();
