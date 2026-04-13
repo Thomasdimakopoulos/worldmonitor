@@ -208,6 +208,13 @@ export const setQuietHours = mutation({
       )
       .unique();
 
+    // Cross-check against persisted value for single-field updates
+    const effectiveStart = args.quietHoursStart ?? existing?.quietHoursStart;
+    const effectiveEnd = args.quietHoursEnd ?? existing?.quietHoursEnd;
+    if (effectiveStart !== undefined && effectiveEnd !== undefined && effectiveStart === effectiveEnd) {
+      throw new ConvexError("quietHoursStart and quietHoursEnd must differ (same value = no quiet window)");
+    }
+
     const now = Date.now();
     const patch = {
       quietHoursEnabled: args.quietHoursEnabled,
@@ -284,6 +291,13 @@ export const setQuietHoursForUser = internalMutation({
         q.eq("userId", userId).eq("variant", rest.variant),
       )
       .unique();
+
+    // Cross-check against persisted value for single-field updates
+    const effectiveStart = rest.quietHoursStart ?? existing?.quietHoursStart;
+    const effectiveEnd = rest.quietHoursEnd ?? existing?.quietHoursEnd;
+    if (effectiveStart !== undefined && effectiveEnd !== undefined && effectiveStart === effectiveEnd) {
+      throw new ConvexError("quietHoursStart and quietHoursEnd must differ (same value = no quiet window)");
+    }
 
     const now = Date.now();
     const patch = {
